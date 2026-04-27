@@ -300,7 +300,9 @@ def test_query_analyzer_dateparser_crash_returns_no_constraint(query_analyzer, m
     def boom(*args, **kwargs):
         raise IndexError("list index out of range")
 
-    monkeypatch.setattr(query_analyzer, "_search_dates", boom)
+    # Patch the worker function instead since we moved to process isolation
+    import hindsight_api.engine.query_analyzer
+    monkeypatch.setattr(hindsight_api.engine.query_analyzer, "_dateparser_search_worker", boom)
 
     # Use a query that doesn't match any of the period regex patterns so the
     # code path actually reaches the dateparser call.
