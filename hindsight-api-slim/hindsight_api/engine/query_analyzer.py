@@ -74,6 +74,22 @@ class QueryAnalyzer(ABC):
         pass
 
 
+def _dateparser_search_worker(query: str, reference_date) -> list:
+    """
+    Worker function to run dateparser.search_dates in a separate process.
+    This prevents dateparser's aggressive internal caching from causing memory leaks.
+    """
+    from dateparser.search import search_dates
+
+    settings = {
+        "RELATIVE_BASE": reference_date,
+        "PREFER_DATES_FROM": "past",
+        "RETURN_AS_TIMEZONE_AWARE": False,
+    }
+
+    return search_dates(query, settings=settings)
+
+
 class DateparserQueryAnalyzer(QueryAnalyzer):
     """
     Query analyzer using dateparser library.
@@ -87,22 +103,45 @@ class DateparserQueryAnalyzer(QueryAnalyzer):
     - No model loading required (lazy import on first use)
     """
 
+    _executor = None
+    _executor_lock = None
+
     def __init__(self):
         """Initialize dateparser query analyzer."""
-        self._search_dates = None
+        super().__init__()
+        import threading
+        if DateparserQueryAnalyzer._executor_lock is None:
+            DateparserQueryAnalyzer._executor_lock = threading.Lock()
+
+    @classmethod
+    def _get_executor(cls):
+        import multiprocessing
+        import concurrent.futures
+
+        if cls._executor is None:
+            with cls._executor_lock:
+                if cls._executor is None:
+                    ctx = multiprocessing.get_context("spawn")
+                    cls._executor = concurrent.futures.ProcessPoolExecutor(
+                        max_workers=1,
+                        mp_context=ctx,
+                        max_tasks_per_child=1,
+                    )
+        return cls._executor
+
+    @classmethod
+    def _reset_executor(cls):
+        """Call this if the executor enters a broken state."""
+        with cls._executor_lock:
+            if cls._executor is not None:
+                cls._executor.shutdown(wait=False, cancel_futures=True)
+            cls._executor = None
 
     def load(self) -> None:
-        """Load dateparser and warm up internal data structures.
-
-        Triggers the real initialization cost (regex tables, timezone data) at
-        load time so the first actual recall doesn't pay the cold-start penalty.
-        """
-        if self._search_dates is None:
-            from dateparser.search import search_dates
-
-            self._search_dates = search_dates
-            # Warm up: fire a dummy call to trigger lazy-loaded internal tables.
-            self._search_dates("today")
+        """Load dateparser and warm up internal data structures."""
+        # Not applicable for process pool executor isolation,
+        # because the spawned process will load on demand.
+        pass
 
     def analyze(self, query: str, reference_date: datetime | None = None) -> QueryAnalysis:
         """
@@ -130,21 +169,29 @@ class DateparserQueryAnalyzer(QueryAnalyzer):
         # Lazy load dateparser (only imports on first call, then cached)
         self.load()
 
-        # Use dateparser's search_dates to find temporal expressions
-        settings = {
-            "RELATIVE_BASE": reference_date,
-            "PREFER_DATES_FROM": "past",
-            "RETURN_AS_TIMEZONE_AWARE": False,
-        }
-
         # Wrap dateparser in a defensive try/except. dateparser has been
         # observed to crash with internal errors (e.g., IndexError from
         # locale.translate_search) on certain query inputs. A parser bug
         # should not bring down the whole search/consolidation pipeline —
         # treat any failure as "no temporal constraint found" so the caller
         # can fall back to non-temporal retrieval.
+        #
+        # Furthermore, dateparser has severe memory leaks due to aggressive
+        # internal regex and locale caching that grows without bound on varying input.
+        # We isolate it in a short-lived worker process to ensure memory is released.
+        import concurrent.futures
+        executor = self._get_executor()
         try:
-            results = self._search_dates(query, settings=settings)
+            future = executor.submit(_dateparser_search_worker, query, reference_date)
+            results = future.result(timeout=10.0)
+        except concurrent.futures.TimeoutError:
+            logger.warning("dateparser search_dates timed out after 10.0s, treating as no temporal constraint")
+            self._reset_executor()
+            return QueryAnalysis(temporal_constraint=None)
+        except concurrent.futures.process.BrokenProcessPool as e:
+            logger.warning(f"dateparser process pool broken: {e}, treating as no temporal constraint")
+            self._reset_executor()
+            return QueryAnalysis(temporal_constraint=None)
         except Exception as e:
             logger.warning(
                 "dateparser raised %s on query (treating as no temporal constraint): %s",
